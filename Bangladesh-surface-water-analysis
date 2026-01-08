@@ -1,0 +1,201 @@
+
+
+// ============================================================================
+// CONFIGURATION SECTION
+// ============================================================================
+
+var CONFIG = {
+  startYear: 1990,
+  endYear: 2024,
+  seasons: {
+    monsoon: {name: 'Monsoon', start: '-06-01', end: '-09-30'},
+    dry: {name: 'Dry', start: '-11-01', end: '-02-28'}
+  },
+  mndwiThreshold: 0.3,
+  ndviSuppressionThreshold: 0.2, 
+  cloudThreshold: 80, // INCREASED to 80 to prevent empty collections
+  scale: 30,
+  compositePercentile: 75,
+  colors: {
+    permanent: '000080',
+    seasonal: '00bfff',
+    lostWater: 'ff0000',
+    gainedWater: '00ff00',
+    monsoonWater: '1e90ff',
+    dryWater: '87ceeb'
+  }
+};
+
+// ============================================================================
+// STUDY AREA
+// ============================================================================
+
+var bangladesh = ee.FeatureCollection('FAO/GAUL/2015/level0')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Bangladesh'));
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+function maskLandsatC2(image) {
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(parseInt('11111', 2)).eq(0);
+  return image.updateMask(mask);
+}
+
+function addWaterIndices(image) {
+  var mndwi = image.normalizedDifference(['Green', 'SWIR1']).rename('MNDWI');
+  var ndvi = image.normalizedDifference(['NIR', 'Red']).rename('NDVI');
+  return image.addBands([mndwi, ndvi]);
+}
+
+function extractWater(image) {
+  var water = image.select('MNDWI').gt(CONFIG.mndwiThreshold)
+    .and(image.select('NDVI').lt(CONFIG.ndviSuppressionThreshold))
+    .rename('water');
+  return image.addBands(water);
+}
+
+function calculateBinaryArea(image, geometry) {
+  var areaImage = ee.Image.pixelArea().updateMask(image);
+  var stats = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geometry,
+    scale: 30,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+  return ee.Number(stats.get('area')).divide(1e6); // km²
+}
+
+// ============================================================================
+// LANDSAT HANDLING
+// ============================================================================
+
+function getLandsatCollection(year, season) {
+  var startDate = season === 'monsoon' ? year + CONFIG.seasons.monsoon.start : year + CONFIG.seasons.dry.start;
+  var endDate = season === 'monsoon' ? year + CONFIG.seasons.monsoon.end : (year + 1) + CONFIG.seasons.dry.end;
+  
+  var collection;
+  if (year >= 1984 && year < 1999) {
+    collection = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7'], ['Blue', 'Green', 'Red', 'NIR', 'SWIR1']);
+  } else if (year >= 1999 && year < 2003) {
+    collection = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2').select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5'], ['Blue', 'Green', 'Red', 'NIR', 'SWIR1']);
+  } else if (year >= 2003 && year < 2013) {
+    collection = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7'], ['Blue', 'Green', 'Red', 'NIR', 'SWIR1']);
+  } else {
+    collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+      .select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6'], ['Blue', 'Green', 'Red', 'NIR', 'SWIR1']);
+  }
+  
+  return collection.filterDate(startDate, endDate)
+    .filterBounds(bangladesh)
+    .filter(ee.Filter.lt('CLOUD_COVER', CONFIG.cloudThreshold))
+    .map(maskLandsatC2);
+}
+
+// SAFE FUNCTION: Handles empty collections without crashing
+function getSeasonalWaterExtent(year, season) {
+  var collection = getLandsatCollection(year, season);
+  var processed = collection.map(addWaterIndices).map(extractWater);
+  
+  // ALGORITHM: Use ee.Algorithms.If to check for empty data
+  return ee.Image(ee.Algorithms.If(
+    processed.size().gt(0),
+    // True: Process Data
+    (function() {
+      var composite = processed.select(['MNDWI', 'NDVI', 'water'])
+        .reduce(ee.Reducer.percentile([CONFIG.compositePercentile]))
+        .clip(bangladesh);
+        
+      return composite.select('MNDWI_p75')
+        .gt(CONFIG.mndwiThreshold)
+        .and(composite.select('NDVI_p75').lt(CONFIG.ndviSuppressionThreshold))
+        .rename('water')
+        .selfMask()
+        .set({'year': year, 'season': season, 'system:time_start': ee.Date.fromYMD(year, season === 'monsoon' ? 7 : 12, 1).millis()});
+    })(),
+    // False: Return Empty Dummy Image
+    ee.Image().rename('water').set({'year': year, 'season': season, 'system:time_start': ee.Date.fromYMD(year, season === 'monsoon' ? 7 : 12, 1).millis()})
+  ));
+}
+
+// ============================================================================
+// JRC ANALYSIS (STATIC STATS)
+// ============================================================================
+
+var gsw = ee.Image("JRC/GSW1_4/GlobalSurfaceWater");
+var gswOccurrence = gsw.select('occurrence').clip(bangladesh);
+var gswTransition = gsw.select('transition').clip(bangladesh);
+
+var permanentWater = gswOccurrence.gt(90).selfMask();
+var seasonalWater = gswOccurrence.gt(10).and(gswOccurrence.lte(90)).selfMask();
+var lostWater = gswTransition.eq(3).or(gswTransition.eq(6)).selfMask();
+var gainedWater = gswTransition.eq(1).or(gswTransition.eq(4)).selfMask();
+
+// ============================================================================
+// TIME SERIES GENERATION (With Safety)
+// ============================================================================
+
+var monsoonImages = [];
+var dryImages = [];
+
+for (var y = CONFIG.startYear; y <= 2023; y += 2) {
+  monsoonImages.push(getSeasonalWaterExtent(y, 'monsoon'));
+  dryImages.push(getSeasonalWaterExtent(y, 'dry'));
+}
+
+var monsoonSeries = ee.ImageCollection(monsoonImages);
+
+// ============================================================================
+// VISUALIZATION & OUTPUT
+// ============================================================================
+
+print('════════════════════════════════════════════════════════════');
+print('🇧🇩 WATER BODY STATISTICS');
+print('════════════════════════════════════════════════════════════');
+
+var stats = {
+  permanent: calculateBinaryArea(permanentWater, bangladesh),
+  seasonal: calculateBinaryArea(seasonalWater, bangladesh),
+  lost: calculateBinaryArea(lostWater, bangladesh),
+  gained: calculateBinaryArea(gainedWater, bangladesh)
+};
+
+stats.permanent.evaluate(function(val) { print('Permanent Water:', val.toFixed(2), 'km²'); });
+stats.seasonal.evaluate(function(val) { print('Seasonal Water:', val.toFixed(2), 'km²'); });
+stats.lost.evaluate(function(val) { print('Lost Water (1984-2021):', val.toFixed(2), 'km²'); });
+stats.gained.evaluate(function(val) { print('Gained Water (1984-2021):', val.toFixed(2), 'km²'); });
+
+Map.centerObject(bangladesh, 7);
+Map.addLayer(gswOccurrence, {min: 0, max: 100, palette: ['white', 'blue']}, 'Water Occurrence %', false);
+Map.addLayer(permanentWater, {palette: [CONFIG.colors.permanent]}, 'Permanent Water', false);
+Map.addLayer(lostWater, {palette: [CONFIG.colors.lostWater]}, 'Lost Water', true);
+
+// Charting
+print(ui.Chart.image.series({
+  imageCollection: monsoonSeries.map(function(img) { 
+    // Handle dummy images with no bands
+    return ee.Image(ee.Algorithms.If(
+       img.bandNames().size().gt(0),
+       img.multiply(ee.Image.pixelArea()).divide(1e6),
+       ee.Image(0).set('system:time_start', img.get('system:time_start'))
+    ));
+  }),
+  region: bangladesh, reducer: ee.Reducer.sum(), scale: 500, xProperty: 'system:time_start'
+}).setOptions({title: 'Monsoon Water Area (km²)', series: {0: {color: CONFIG.colors.monsoonWater}}}));
+
+// Legend
+var legend = ui.Panel({style: {position: 'bottom-right', padding: '8px 15px'}});
+legend.add(ui.Label({value: '🇧🇩 Analysis', style: {fontWeight: 'bold', fontSize: '16px'}}));
+var addRow = function(color, name) {
+  var box = ui.Label({style: {backgroundColor: '#' + color, padding: '8px', margin: '0 4px 4px 0', border: '1px solid black'}});
+  legend.add(ui.Panel({widgets: [box, ui.Label({value: name, style: {margin: '0 0 4px 6px'}})], layout: ui.Panel.Layout.Flow('horizontal')}));
+};
+addRow(CONFIG.colors.permanent, 'Permanent');
+addRow(CONFIG.colors.lostWater, 'Lost Water');
+Map.add(legend);
+
+// Exports
+Export.image.toDrive({image: lostWater.unmask(0), description: 'Bangladesh_Lost_Water_JRC', scale: 30, region: bangladesh, maxPixels: 1e10});
+Export.image.toDrive({image: gswOccurrence, description: 'Bangladesh_Water_Occurrence_JRC', scale: 30, region: bangladesh, maxPixels: 1e10});
